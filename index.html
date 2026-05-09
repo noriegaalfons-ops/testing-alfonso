@@ -349,8 +349,8 @@
   <!-- Mic indicator -->
   <div class="mic-wrap">
     <div class="mic-icon" id="mic-icon">🎙️</div>
-    <div class="mic-label">Di la palabra</div>
-    <div class="keyword">"SATURNO"</div>
+    <div class="mic-label">Comandos de voz</div>
+    <div class="keyword">"SATURNO" · "PAUSA" · "PLAY"</div>
   </div>
 
   <!-- Progress ring -->
@@ -386,27 +386,28 @@
 
   <!-- Log -->
   <div class="log" id="log">
-    <span class="log-line hi">// Di "Saturno" para iniciar.</span>
+    <span class="log-line hi">// Di "Saturno" para iniciar · "Pausa" · "Play"</span>
   </div>
 
 </div>
 
 <script>
-  const WAIT_TOTAL = 5;   // segundos de espera antes de reproducir
-  const ON_TOTAL   = 20;  // segundos de reproducción
-  const CIRCUM     = 452.39; // 2π×72
+  const WAIT_TOTAL = 5;
+  const ON_TOTAL   = 20;
+  const CIRCUM     = 452.39;
 
   let fase        = 'idle';  // idle | wait | playing | paused
   let timer       = null;
   let seg         = 0;
   let total       = 1;
+  let segRestantes = ON_TOTAL; // cuántos segundos quedan al pausar
   let audioCtx    = null;
   let audioBuffer = null;
   let sourceNode  = null;
   let gainNode    = null;
   let recognition = null;
-  let audioOffset = 0;      // para reanudar desde donde pausó
-  let playStart   = 0;      // ctx.currentTime cuando se inició
+  let audioOffset = 0;
+  let playStart   = 0;
 
   const ring       = document.getElementById('ring');
   const numEl      = document.getElementById('num');
@@ -449,19 +450,28 @@
     return audioCtx;
   }
 
+  // Al elegir archivo: detener reconocimiento, cargar, reiniciar reconocimiento
   fileInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+
+    // Pausar reconocimiento para liberar micrófono durante la carga
+    detenerReconocimiento();
+    log('Cargando archivo...', 'hi');
+
     try {
       const ctx = getCtx();
       audioBuffer = await ctx.decodeAudioData(await file.arrayBuffer());
       fileLabel.textContent = '🎵 ' + file.name;
       fileLabel.style.color = 'var(--green)';
-      log('Audio: ' + file.name, 'ok');
+      log('Audio listo: ' + file.name, 'ok');
     } catch (err) {
       log('Error al cargar: ' + err.message, 'err');
       audioBuffer = null;
     }
+
+    // Reiniciar micrófono después de cargar
+    setTimeout(() => iniciarReconocimiento(), 400);
   });
 
   // ── Reproducción ──────────────────────────────────────────────────────────
@@ -480,7 +490,6 @@
       sourceNode.connect(gainNode);
       sourceNode.start(0, offset % audioBuffer.duration);
     } else {
-      // Tono continuo 528 Hz (frecuencia "cósmica") con vibrato
       sourceNode = ctx.createOscillator();
       const lfo  = ctx.createOscillator();
       const lfoG = ctx.createGain();
@@ -503,11 +512,11 @@
     const ctx = getCtx();
     audioOffset = ctx.currentTime - playStart;
     gainNode.gain.setValueAtTime(gainNode.gain.value, ctx.currentTime);
-    gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3);
+    gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.25);
     setTimeout(() => {
       try { sourceNode.stop(); } catch(_) {}
       sourceNode = null;
-    }, 350);
+    }, 300);
   }
 
   // ── Flujo principal ───────────────────────────────────────────────────────
@@ -516,6 +525,8 @@
     fase  = 'wait';
     seg   = WAIT_TOTAL;
     total = WAIT_TOTAL;
+    segRestantes = ON_TOTAL; // reinicio completo
+    audioOffset  = 0;
     actualizarRing(seg, total, 'var(--yellow)');
     cdLabel.textContent = 'para sonar';
     setStatus('Preparando...', 'waiting');
@@ -527,53 +538,83 @@
       seg--;
       actualizarRing(seg, total, seg <= 2 ? '#ff9933' : 'var(--yellow)');
       if (seg <= 0) {
-        clearInterval(timer);
-        timer = null;
-        iniciarReproduccion();
+        clearInterval(timer); timer = null;
+        iniciarReproduccion(0);
       }
     }, 1000);
   }
 
-  function iniciarReproduccion() {
-    fase       = 'playing';
-    audioOffset = 0;
-    seg        = ON_TOTAL;
-    total      = ON_TOTAL;
+  function iniciarReproduccion(offset) {
+    fase  = 'playing';
+    seg   = segRestantes;
+    total = ON_TOTAL;
     actualizarRing(seg, total, 'var(--accent)');
     cdLabel.textContent = 'sonando';
     setStatus('Reproduciendo ♪', 'playing');
     document.body.classList.add('playing');
-    log('Audio iniciado — ' + ON_TOTAL + ' s', 'ok');
+    micIcon.className = 'mic-icon listening';
+    log('Audio reproduciendo — ' + seg + ' s restantes', 'ok');
 
-    reproducir(0);
+    reproducir(offset);
+
+    // Mantener reconocimiento activo para escuchar "pausa"
+    iniciarReconocimiento();
 
     timer = setInterval(() => {
       seg--;
+      segRestantes = seg;
       actualizarRing(seg, total, seg <= 5 ? 'var(--accent2)' : 'var(--accent)');
       if (seg <= 0) {
-        clearInterval(timer);
-        timer = null;
+        clearInterval(timer); timer = null;
         finalizarReproduccion();
       }
     }, 1000);
   }
 
+  function pausarPorVoz() {
+    if (fase !== 'playing') return;
+    clearInterval(timer); timer = null;
+    pausarAudio();
+    fase = 'paused';
+    document.body.classList.remove('playing');
+    cdLabel.textContent = 'pausado';
+    numEl.textContent = segRestantes;
+    ring.style.stroke = 'var(--muted)';
+    setStatus('Pausado ■  · Di "play"', 'paused');
+    micIcon.className = 'mic-icon listening';
+    log('Pausado. Quedan ' + segRestantes + ' s. Di "play" para continuar.', 'warn');
+  }
+
+  function reanudarPorVoz() {
+    if (fase !== 'paused' || segRestantes <= 0) return;
+    log('Reanudando desde ' + segRestantes + ' s restantes...', 'hi');
+    iniciarReproduccion(audioOffset);
+  }
+
   function finalizarReproduccion() {
     pausarAudio();
     document.body.classList.remove('playing');
-    fase = 'paused';
+    fase = 'idle';
+    segRestantes = ON_TOTAL;
+    audioOffset  = 0;
     numEl.textContent  = '✓';
-    cdLabel.textContent = 'pausado';
+    cdLabel.textContent = 'finalizado';
     ring.style.strokeDashoffset = CIRCUM;
     ring.style.stroke = 'var(--muted)';
-    setStatus('Pausado ■', 'paused');
+    setStatus('Listo ✓  · Di "Saturno"', 'paused');
     micIcon.className = 'mic-icon listening';
-    log('Audio pausado. Di "Saturno" para volver a reproducir.', 'warn');
-    // Reactivar reconocimiento de voz
+    log('Audio finalizado. Di "Saturno" para repetir.', 'ok');
     iniciarReconocimiento();
   }
 
   // ── Reconocimiento de voz ─────────────────────────────────────────────────
+
+  function detenerReconocimiento() {
+    if (recognition) {
+      try { recognition.abort(); } catch(_) {}
+      recognition = null;
+    }
+  }
 
   function iniciarReconocimiento() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -584,9 +625,8 @@
       return;
     }
 
-    if (recognition) {
-      try { recognition.stop(); } catch(_) {}
-    }
+    // Evitar instancias duplicadas
+    detenerReconocimiento();
 
     recognition = new SR();
     recognition.lang = 'es-ES';
@@ -594,18 +634,35 @@
     recognition.interimResults = true;
 
     recognition.onstart = () => {
-      setStatus('Escuchando...', 'listening');
-      micIcon.className = 'mic-icon listening';
+      if (fase !== 'playing') {
+        setStatus('Escuchando...', 'listening');
+        micIcon.className = 'mic-icon listening';
+      }
     };
 
     recognition.onresult = (e) => {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const texto = e.results[i][0].transcript.toLowerCase().trim();
-        log('Escuché: "' + texto + '"');
-        if (texto.includes('saturno')) {
-          recognition.stop();
-          getCtx(); // inicializar AudioContext desde resultado de voz (aún en contexto de evento)
+
+        // Comandos
+        if (texto.includes('saturno') && (fase === 'idle' || fase === 'paused' && segRestantes === ON_TOTAL)) {
+          log('Comando: "saturno"', 'hi');
+          detenerReconocimiento();
+          getCtx();
           iniciarEspera();
+          return;
+        }
+        if (texto.includes('pausa') && fase === 'playing') {
+          log('Comando: "pausa"', 'hi');
+          detenerReconocimiento();
+          pausarPorVoz();
+          setTimeout(() => iniciarReconocimiento(), 400);
+          return;
+        }
+        if ((texto.includes('play') || texto.includes('continuar') || texto.includes('reanudar')) && fase === 'paused') {
+          log('Comando: "play"', 'hi');
+          detenerReconocimiento();
+          reanudarPorVoz();
           return;
         }
       }
@@ -613,8 +670,9 @@
 
     recognition.onerror = (e) => {
       if (e.error === 'no-speech' || e.error === 'aborted') {
-        // Reiniciar silenciosamente
-        setTimeout(() => iniciarReconocimiento(), 300);
+        setTimeout(() => {
+          if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+        }, 300);
         return;
       }
       log('Error de voz: ' + e.error, 'err');
@@ -626,20 +684,16 @@
     };
 
     recognition.onend = () => {
-      // Si no estamos en medio de otra fase, reiniciar escucha
-      if (fase === 'idle' || fase === 'paused') {
-        setTimeout(() => iniciarReconocimiento(), 200);
-      }
+      setTimeout(() => {
+        if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+      }, 200);
     };
 
-    try {
-      recognition.start();
-    } catch(e) {
+    try { recognition.start(); } catch(_) {
       setTimeout(() => iniciarReconocimiento(), 500);
     }
   }
 
-  // Arrancar al cargar
   window.addEventListener('load', () => {
     iniciarReconocimiento();
   });
