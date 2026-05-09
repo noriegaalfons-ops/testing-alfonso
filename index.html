@@ -313,6 +313,1042 @@
     }
     .audio-pick:hover { border-color: var(--accent); color: var(--accent2); }
 
+    body.torch-on::after {
+      content: '';
+      position: fixed;
+      bottom: -60px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 280px;
+      height: 280px;
+      background: radial-gradient(circle, rgba(245,230,66,0.14) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+      animation: torch-glow 1.8s ease-in-out infinite;
+    }
+
+    @keyframes torch-glow {
+      0%,100% { opacity: 0.6; transform: translateX(-50%) scale(1); }
+      50%      { opacity: 1;   transform: translateX(-50%) scale(1.15); }
+    }
+
+    /* Log */
+    .log {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 0.58rem;
+      color: var(--muted);
+      letter-spacing: 0.07em;
+      max-height: 75px;
+      overflow-y: auto;
+      line-height: 1.9;
+    }
+
+    .log-line       { display: block; }
+    .log-line.hi    { color: var(--accent2); }
+    .log-line.ok    { color: var(--green); }
+    .log-line.err   { color: var(--danger); }
+    .log-line.warn  { color: var(--yellow); }
+  </style>
+</head>
+<body>
+
+<div class="glow"></div>
+
+<div class="container">
+
+  <header>
+    <div class="title">Saturno</div>
+    <div class="subtitle">Activación por voz · 20 s de audio</div>
+  </header>
+
+  <!-- Mic indicator -->
+  <div class="mic-wrap">
+    <div class="mic-icon" id="mic-icon">🎙️</div>
+    <div class="mic-label">Comandos de voz</div>
+    <div class="keyword">"SATURNO" · "PAUSA" · "PLAY"</div>
+  </div>
+
+  <!-- Progress ring -->
+  <div class="ring-wrap">
+    <svg viewBox="0 0 170 170">
+      <circle class="ring-bg"   cx="85" cy="85" r="72"/>
+      <circle class="ring-deco" cx="85" cy="85" r="82"/>
+      <circle class="ring-progress" id="ring" cx="85" cy="85" r="72"/>
+    </svg>
+    <div class="ring-center">
+      <span class="countdown-num" id="num">—</span>
+      <span class="countdown-label" id="cd-label">en espera</span>
+    </div>
+  </div>
+
+  <!-- Sound wave -->
+  <div class="wave">
+    <span></span><span></span><span></span><span></span>
+    <span></span><span></span><span></span>
+  </div>
+
+  <!-- Status -->
+  <div class="status listening" id="status">
+    <div class="status-dot"></div>
+    <span id="status-text">Escuchando...</span>
+  </div>
+
+  <!-- Audio file picker -->
+  <label class="audio-pick" for="audio-file">
+    <input type="file" id="audio-file" accept="audio/*" style="display:none">
+    <span id="file-label">🔔 Beep generado · toca para elegir tu audio</span>
+  </label>
+
+  <!-- Log -->
+  <div class="log" id="log">
+    <span class="log-line hi">// Di "Saturno" para iniciar · "Pausa" · "Play"</span>
+  </div>
+
+</div>
+
+<script>
+  const WAIT_TOTAL = 5;
+  const ON_TOTAL   = 20;
+  const CIRCUM     = 452.39;
+
+  let fase         = 'idle';
+  let timer        = null;
+  let seg          = 0;
+  let total        = 1;
+  let segRestantes = ON_TOTAL;
+  let audioCtx     = null;
+  let audioBuffer  = null;
+  let sourceNode   = null;
+  let gainNode     = null;
+  let recognition  = null;
+  let audioOffset  = 0;
+  let playStart    = 0;
+
+  // ── Linterna ──────────────────────────────────────────────────────────────
+  let camTrack     = null;  // VideoTrack con torch
+
+  async function encenderLinterna() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } }
+      });
+      const tracks = stream.getVideoTracks();
+      if (!tracks.length) throw new Error('Sin cámara trasera');
+      camTrack = tracks[0];
+      const caps = camTrack.getCapabilities ? camTrack.getCapabilities() : {};
+      if (!caps.torch) {
+        camTrack.stop(); camTrack = null;
+        log('Torch no disponible en este dispositivo', 'warn');
+        return;
+      }
+      await camTrack.applyConstraints({ advanced: [{ torch: true }] });
+      log('Linterna encendida ⚡', 'ok');
+      document.body.classList.add('torch-on');
+    } catch (err) {
+      log('Linterna: ' + (err.message || err.name), 'warn');
+      camTrack = null;
+    }
+  }
+
+  async function apagarLinterna() {
+    if (!camTrack) return;
+    try { await camTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(_) {}
+    camTrack.stop();
+    camTrack = null;
+    document.body.classList.remove('torch-on');
+    log('Linterna apagada', 'ok');
+  }
+
+  const ring       = document.getElementById('ring');
+  const numEl      = document.getElementById('num');
+  const cdLabel    = document.getElementById('cd-label');
+  const statusEl   = document.getElementById('status');
+  const statusText = document.getElementById('status-text');
+  const micIcon    = document.getElementById('mic-icon');
+  const logEl      = document.getElementById('log');
+  const fileInput  = document.getElementById('audio-file');
+  const fileLabel  = document.getElementById('file-label');
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function log(msg, cls = '') {
+    const line = document.createElement('span');
+    line.className = 'log-line' + (cls ? ' ' + cls : '');
+    const t = new Date().toLocaleTimeString('es', { hour12: false });
+    line.textContent = `[${t}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(txt, cls) {
+    statusEl.className = 'status ' + (cls || '');
+    statusText.textContent = txt;
+  }
+
+  function actualizarRing(s, tot, color) {
+    const offset = tot > 0 ? CIRCUM * (s / tot) : CIRCUM;
+    ring.style.strokeDashoffset = offset;
+    ring.style.stroke = color || 'var(--accent)';
+    numEl.textContent = s > 0 ? s : (s === 0 ? '0' : '—');
+  }
+
+  // ── Audio Context ─────────────────────────────────────────────────────────
+
+  function getCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    detenerReconocimiento();
+    log('Cargando archivo...', 'hi');
+    try {
+      const ctx = getCtx();
+      audioBuffer = await ctx.decodeAudioData(await file.arrayBuffer());
+      fileLabel.textContent = '🎵 ' + file.name;
+      fileLabel.style.color = 'var(--green)';
+      log('Audio listo: ' + file.name, 'ok');
+    } catch (err) {
+      log('Error al cargar: ' + err.message, 'err');
+      audioBuffer = null;
+    }
+    setTimeout(() => iniciarReconocimiento(), 400);
+  });
+
+  // ── Reproducción ──────────────────────────────────────────────────────────
+
+  function reproducir(offset = 0) {
+    const ctx = getCtx();
+    gainNode = ctx.createGain();
+    gainNode.gain.setValueAtTime(0, ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(1, ctx.currentTime + 0.3);
+    gainNode.connect(ctx.destination);
+
+    if (audioBuffer) {
+      sourceNode = ctx.createBufferSource();
+      sourceNode.buffer = audioBuffer;
+      sourceNode.loop = true;
+      sourceNode.connect(gainNode);
+      sourceNode.start(0, offset % audioBuffer.duration);
+    } else {
+      sourceNode = ctx.createOscillator();
+      const lfo  = ctx.createOscillator();
+      const lfoG = ctx.createGain();
+      lfo.frequency.setValueAtTime(4, ctx.currentTime);
+      lfoG.gain.setValueAtTime(8, ctx.currentTime);
+      lfo.connect(lfoG);
+      lfoG.connect(sourceNode.frequency);
+      sourceNode.type = 'sine';
+      sourceNode.frequency.setValueAtTime(528, ctx.currentTime);
+      sourceNode.connect(gainNode);
+      lfo.start();
+      sourceNode.start();
+    }
+    playStart = ctx.currentTime - offset;
+  }
+
+  function pausarAudio() {
+    if (!sourceNode) return;
+    const ctx = getCtx();
+    audioOffset = ctx.currentTime - playStart;
+    gainNode.gain.setValueAtTime(gainNode.gain.value, ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.25);
+    setTimeout(() => {
+      try { sourceNode.stop(); } catch(_) {}
+      sourceNode = null;
+    }, 300);
+  }
+
+  // ── Flujo principal ───────────────────────────────────────────────────────
+
+  function iniciarEspera() {
+    fase  = 'wait';
+    seg   = WAIT_TOTAL;
+    total = WAIT_TOTAL;
+    segRestantes = ON_TOTAL;
+    audioOffset  = 0;
+    actualizarRing(seg, total, 'var(--yellow)');
+    cdLabel.textContent = 'para sonar';
+    setStatus('Preparando...', 'waiting');
+    micIcon.className = 'mic-icon detected';
+    document.body.classList.remove('playing');
+    log('Palabra detectada — iniciando en ' + WAIT_TOTAL + ' s', 'hi');
+
+    timer = setInterval(() => {
+      seg--;
+      actualizarRing(seg, total, seg <= 2 ? '#ff9933' : 'var(--yellow)');
+      if (seg <= 0) {
+        clearInterval(timer); timer = null;
+        iniciarReproduccion(0);
+      }
+    }, 1000);
+  }
+
+  function iniciarReproduccion(offset) {
+    fase  = 'playing';
+    seg   = segRestantes;
+    total = ON_TOTAL;
+    actualizarRing(seg, total, 'var(--accent)');
+    cdLabel.textContent = 'sonando';
+    setStatus('Reproduciendo ♪  🔦', 'playing');
+    document.body.classList.add('playing');
+    micIcon.className = 'mic-icon listening';
+    log('Audio + linterna — ' + seg + ' s', 'ok');
+
+    reproducir(offset);
+    encenderLinterna();   // ← enciende linterna junto con el audio
+    iniciarReconocimiento();
+
+    timer = setInterval(() => {
+      seg--;
+      segRestantes = seg;
+      actualizarRing(seg, total, seg <= 5 ? 'var(--accent2)' : 'var(--accent)');
+      if (seg <= 0) {
+        clearInterval(timer); timer = null;
+        finalizarReproduccion();
+      }
+    }, 1000);
+  }
+
+  function pausarPorVoz() {
+    if (fase !== 'playing') return;
+    clearInterval(timer); timer = null;
+    pausarAudio();
+    apagarLinterna();     // ← apaga linterna al pausar
+    fase = 'paused';
+    document.body.classList.remove('playing');
+    cdLabel.textContent = 'pausado';
+    numEl.textContent = segRestantes;
+    ring.style.stroke = 'var(--muted)';
+    setStatus('Pausado ■  · Di "play"', 'paused');
+    micIcon.className = 'mic-icon listening';
+    log('Pausado. Quedan ' + segRestantes + ' s. Di "play" para continuar.', 'warn');
+  }
+
+  function reanudarPorVoz() {
+    if (fase !== 'paused' || segRestantes <= 0) return;
+    log('Reanudando desde ' + segRestantes + ' s restantes...', 'hi');
+    iniciarReproduccion(audioOffset);
+  }
+
+  function finalizarReproduccion() {
+    pausarAudio();
+    apagarLinterna();     // ← apaga linterna al finalizar
+    document.body.classList.remove('playing');
+    fase = 'idle';
+    segRestantes = ON_TOTAL;
+    audioOffset  = 0;
+    numEl.textContent   = '✓';
+    cdLabel.textContent = 'finalizado';
+    ring.style.strokeDashoffset = CIRCUM;
+    ring.style.stroke = 'var(--muted)';
+    setStatus('Listo ✓  · Di "Saturno"', 'paused');
+    micIcon.className = 'mic-icon listening';
+    log('Finalizado. Di "Saturno" para repetir.', 'ok');
+    iniciarReconocimiento();
+  }
+
+  // ── Reconocimiento de voz ─────────────────────────────────────────────────
+
+  function detenerReconocimiento() {
+    if (recognition) {
+      try { recognition.abort(); } catch(_) {}
+      recognition = null;
+    }
+  }
+
+  function iniciarReconocimiento() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      log('SpeechRecognition no disponible', 'err');
+      setStatus('Sin soporte de voz', 'error');
+      micIcon.className = 'mic-icon error';
+      return;
+    }
+    detenerReconocimiento();
+
+    recognition = new SR();
+    recognition.lang = 'es-ES';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      if (fase !== 'playing') {
+        setStatus('Escuchando...', 'listening');
+        micIcon.className = 'mic-icon listening';
+      }
+    };
+
+    recognition.onresult = (e) => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const texto = e.results[i][0].transcript.toLowerCase().trim();
+
+        if (texto.includes('saturno') && (fase === 'idle' || (fase === 'paused' && segRestantes === ON_TOTAL))) {
+          log('Comando: "saturno"', 'hi');
+          detenerReconocimiento();
+          getCtx();
+          iniciarEspera();
+          return;
+        }
+        if (texto.includes('pausa') && fase === 'playing') {
+          log('Comando: "pausa"', 'hi');
+          detenerReconocimiento();
+          pausarPorVoz();
+          setTimeout(() => iniciarReconocimiento(), 400);
+          return;
+        }
+        if ((texto.includes('play') || texto.includes('continuar') || texto.includes('reanudar')) && fase === 'paused') {
+          log('Comando: "play"', 'hi');
+          detenerReconocimiento();
+          reanudarPorVoz();
+          return;
+        }
+      }
+    };
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') {
+        setTimeout(() => {
+          if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+        }, 300);
+        return;
+      }
+      log('Error de voz: ' + e.error, 'err');
+      if (e.error === 'not-allowed') {
+        setStatus('Micrófono bloqueado', 'error');
+        micIcon.className = 'mic-icon error';
+        log('→ Permite el micrófono en Chrome y recarga', 'err');
+      }
+    };
+
+    recognition.onend = () => {
+      setTimeout(() => {
+        if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+      }, 200);
+    };
+
+    try { recognition.start(); } catch(_) {
+      setTimeout(() => iniciarReconocimiento(), 500);
+    }
+  }
+
+  window.addEventListener('load', () => {
+    iniciarReconocimiento();
+  });
+</script>
+
+  const ring       = document.getElementById('ring');
+  const numEl      = document.getElementById('num');
+  const cdLabel    = document.getElementById('cd-label');
+  const statusEl   = document.getElementById('status');
+  const statusText = document.getElementById('status-text');
+  const micIcon    = document.getElementById('mic-icon');
+  const logEl      = document.getElementById('log');
+  const fileInput  = document.getElementById('audio-file');
+  const fileLabel  = document.getElementById('file-label');
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function log(msg, cls = '') {
+    const line = document.createElement('span');
+    line.className = 'log-line' + (cls ? ' ' + cls : '');
+    const t = new Date().toLocaleTimeString('es', { hour12: false });
+    line.textContent = `[${t}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(txt, cls) {
+    statusEl.className = 'status ' + (cls || '');
+    statusText.textContent = txt;
+  }
+
+  function actualizarRing(s, tot, color) {
+    const offset = tot > 0 ? CIRCUM * (s / tot) : CIRCUM;
+    ring.style.strokeDashoffset = offset;
+    ring.style.stroke = color || 'var(--accent)';
+    numEl.textContent = s > 0 ? s : (s === 0 ? '0' : '—');
+  }
+
+  // ── Audio Context ─────────────────────────────────────────────────────────
+
+  function getCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+
+  // Al elegir archivo: detener reconocimiento, cargar, reiniciar reconocimiento
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    // Pausar reconocimiento para liberar micrófono durante la carga
+    detenerReconocimiento();
+    log('Cargando archivo...', 'hi');
+
+    try {
+      const ctx = getCtx();
+      audioBuffer = await ctx.decodeAudioData(await file.arrayBuffer());
+      fileLabel.textContent = '🎵 ' + file.name;
+      fileLabel.style.color = 'var(--green)';
+      log('Audio listo: ' + file.name, 'ok');
+    } catch (err) {
+      log('Error al cargar: ' + err.message, 'err');
+      audioBuffer = null;
+    }
+
+    // Reiniciar micrófono después de cargar
+    setTimeout(() => iniciarReconocimiento(), 400);
+  });
+
+  // ── Reproducción ──────────────────────────────────────────────────────────
+
+  function reproducir(offset = 0) {
+    const ctx = getCtx();
+    gainNode = ctx.createGain();
+    gainNode.gain.setValueAtTime(0, ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(1, ctx.currentTime + 0.3);
+    gainNode.connect(ctx.destination);
+
+    if (audioBuffer) {
+      sourceNode = ctx.createBufferSource();
+      sourceNode.buffer = audioBuffer;
+      sourceNode.loop = true;
+      sourceNode.connect(gainNode);
+      sourceNode.start(0, offset % audioBuffer.duration);
+    } else {
+      sourceNode = ctx.createOscillator();
+      const lfo  = ctx.createOscillator();
+      const lfoG = ctx.createGain();
+      lfo.frequency.setValueAtTime(4, ctx.currentTime);
+      lfoG.gain.setValueAtTime(8, ctx.currentTime);
+      lfo.connect(lfoG);
+      lfoG.connect(sourceNode.frequency);
+      sourceNode.type = 'sine';
+      sourceNode.frequency.setValueAtTime(528, ctx.currentTime);
+      sourceNode.connect(gainNode);
+      lfo.start();
+      sourceNode.start();
+    }
+
+    playStart = ctx.currentTime - offset;
+  }
+
+  function pausarAudio() {
+    if (!sourceNode) return;
+    const ctx = getCtx();
+    audioOffset = ctx.currentTime - playStart;
+    gainNode.gain.setValueAtTime(gainNode.gain.value, ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.25);
+    setTimeout(() => {
+      try { sourceNode.stop(); } catch(_) {}
+      sourceNode = null;
+    }, 300);
+  }
+
+  // ── Flujo principal ───────────────────────────────────────────────────────
+
+  function iniciarEspera() {
+    fase  = 'wait';
+    seg   = WAIT_TOTAL;
+    total = WAIT_TOTAL;
+    segRestantes = ON_TOTAL; // reinicio completo
+    audioOffset  = 0;
+    actualizarRing(seg, total, 'var(--yellow)');
+    cdLabel.textContent = 'para sonar';
+    setStatus('Preparando...', 'waiting');
+    micIcon.className = 'mic-icon detected';
+    document.body.classList.remove('playing');
+    log('Palabra detectada — reproduciendo en ' + WAIT_TOTAL + ' s', 'hi');
+
+    timer = setInterval(() => {
+      seg--;
+      actualizarRing(seg, total, seg <= 2 ? '#ff9933' : 'var(--yellow)');
+      if (seg <= 0) {
+        clearInterval(timer); timer = null;
+        iniciarReproduccion(0);
+      }
+    }, 1000);
+  }
+
+  function iniciarReproduccion(offset) {
+    fase  = 'playing';
+    seg   = segRestantes;
+    total = ON_TOTAL;
+    actualizarRing(seg, total, 'var(--accent)');
+    cdLabel.textContent = 'sonando';
+    setStatus('Reproduciendo ♪', 'playing');
+    document.body.classList.add('playing');
+    micIcon.className = 'mic-icon listening';
+    log('Audio reproduciendo — ' + seg + ' s restantes', 'ok');
+
+    reproducir(offset);
+
+    // Mantener reconocimiento activo para escuchar "pausa"
+    iniciarReconocimiento();
+
+    timer = setInterval(() => {
+      seg--;
+      segRestantes = seg;
+      actualizarRing(seg, total, seg <= 5 ? 'var(--accent2)' : 'var(--accent)');
+      if (seg <= 0) {
+        clearInterval(timer); timer = null;
+        finalizarReproduccion();
+      }
+    }, 1000);
+  }
+
+  function pausarPorVoz() {
+    if (fase !== 'playing') return;
+    clearInterval(timer); timer = null;
+    pausarAudio();
+    fase = 'paused';
+    document.body.classList.remove('playing');
+    cdLabel.textContent = 'pausado';
+    numEl.textContent = segRestantes;
+    ring.style.stroke = 'var(--muted)';
+    setStatus('Pausado ■  · Di "play"', 'paused');
+    micIcon.className = 'mic-icon listening';
+    log('Pausado. Quedan ' + segRestantes + ' s. Di "play" para continuar.', 'warn');
+  }
+
+  function reanudarPorVoz() {
+    if (fase !== 'paused' || segRestantes <= 0) return;
+    log('Reanudando desde ' + segRestantes + ' s restantes...', 'hi');
+    iniciarReproduccion(audioOffset);
+  }
+
+  function finalizarReproduccion() {
+    pausarAudio();
+    document.body.classList.remove('playing');
+    fase = 'idle';
+    segRestantes = ON_TOTAL;
+    audioOffset  = 0;
+    numEl.textContent  = '✓';
+    cdLabel.textContent = 'finalizado';
+    ring.style.strokeDashoffset = CIRCUM;
+    ring.style.stroke = 'var(--muted)';
+    setStatus('Listo ✓  · Di "Saturno"', 'paused');
+    micIcon.className = 'mic-icon listening';
+    log('Audio finalizado. Di "Saturno" para repetir.', 'ok');
+    iniciarReconocimiento();
+  }
+
+  // ── Reconocimiento de voz ─────────────────────────────────────────────────
+
+  function detenerReconocimiento() {
+    if (recognition) {
+      try { recognition.abort(); } catch(_) {}
+      recognition = null;
+    }
+  }
+
+  function iniciarReconocimiento() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      log('SpeechRecognition no disponible en este navegador', 'err');
+      setStatus('Sin soporte de voz', 'error');
+      micIcon.className = 'mic-icon error';
+      return;
+    }
+
+    // Evitar instancias duplicadas
+    detenerReconocimiento();
+
+    recognition = new SR();
+    recognition.lang = 'es-ES';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      if (fase !== 'playing') {
+        setStatus('Escuchando...', 'listening');
+        micIcon.className = 'mic-icon listening';
+      }
+    };
+
+    recognition.onresult = (e) => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const texto = e.results[i][0].transcript.toLowerCase().trim();
+
+        // Comandos
+        if (texto.includes('saturno') && (fase === 'idle' || fase === 'paused' && segRestantes === ON_TOTAL)) {
+          log('Comando: "saturno"', 'hi');
+          detenerReconocimiento();
+          getCtx();
+          iniciarEspera();
+          return;
+        }
+        if (texto.includes('pausa') && fase === 'playing') {
+          log('Comando: "pausa"', 'hi');
+          detenerReconocimiento();
+          pausarPorVoz();
+          setTimeout(() => iniciarReconocimiento(), 400);
+          return;
+        }
+        if ((texto.includes('play') || texto.includes('continuar') || texto.includes('reanudar')) && fase === 'paused') {
+          log('Comando: "play"', 'hi');
+          detenerReconocimiento();
+          reanudarPorVoz();
+          return;
+        }
+      }
+    };
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') {
+        setTimeout(() => {
+          if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+        }, 300);
+        return;
+      }
+      log('Error de voz: ' + e.error, 'err');
+      if (e.error === 'not-allowed') {
+        setStatus('Micrófono bloqueado', 'error');
+        micIcon.className = 'mic-icon error';
+        log('→ Permite el micrófono en Chrome y recarga', 'err');
+      }
+    };
+
+    recognition.onend = () => {
+      setTimeout(() => {
+        if (fase === 'idle' || fase === 'paused' || fase === 'playing') iniciarReconocimiento();
+      }, 200);
+    };
+
+    try { recognition.start(); } catch(_) {
+      setTimeout(() => iniciarReconocimiento(), 500);
+    }
+  }
+
+  window.addEventListener('load', () => {
+    iniciarReconocimiento();
+  });
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sonido · Saturno</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #07080f;
+      --surface: #0e1020;
+      --border: #1e2240;
+      --accent: #7b6ff0;
+      --accent2: #a78bfa;
+      --text: #dde1f5;
+      --muted: #4a5080;
+      --danger: #ff4466;
+      --green: #42f5b0;
+      --yellow: #f5d642;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'DM Mono', monospace;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 28px 16px 32px;
+      overflow-y: auto;
+      position: relative;
+    }
+
+    /* Stars background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(1px 1px at 15% 20%, rgba(255,255,255,0.6) 0%, transparent 100%),
+        radial-gradient(1px 1px at 40% 60%, rgba(255,255,255,0.4) 0%, transparent 100%),
+        radial-gradient(1.5px 1.5px at 70% 15%, rgba(255,255,255,0.5) 0%, transparent 100%),
+        radial-gradient(1px 1px at 85% 75%, rgba(255,255,255,0.3) 0%, transparent 100%),
+        radial-gradient(1px 1px at 55% 85%, rgba(255,255,255,0.5) 0%, transparent 100%),
+        radial-gradient(1.5px 1.5px at 25% 90%, rgba(255,255,255,0.4) 0%, transparent 100%),
+        radial-gradient(1px 1px at 92% 40%, rgba(255,255,255,0.6) 0%, transparent 100%),
+        radial-gradient(1px 1px at 10% 55%, rgba(255,255,255,0.3) 0%, transparent 100%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Glow when playing */
+    .glow {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 400px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(123,111,240,0.18) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0;
+      transition: opacity 0.8s;
+    }
+
+    body.playing .glow { opacity: 1; animation: glow-pulse 2s ease-in-out infinite; }
+
+    @keyframes glow-pulse {
+      0%,100% { transform: translate(-50%,-50%) scale(1);   opacity: 0.7; }
+      50%      { transform: translate(-50%,-50%) scale(1.2); opacity: 1; }
+    }
+
+    .container {
+      width: min(360px, 94vw);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 22px;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* Header */
+    header { text-align: center; }
+
+    .title {
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: clamp(2.8rem, 13vw, 4.5rem);
+      letter-spacing: 0.1em;
+      color: var(--accent2);
+      line-height: 1;
+      text-shadow: 0 0 30px rgba(167,139,250,0.4);
+    }
+
+    .subtitle {
+      font-size: 0.58rem;
+      letter-spacing: 0.28em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    /* Mic indicator */
+    .mic-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .mic-icon {
+      width: 54px;
+      height: 54px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      transition: all 0.4s;
+      position: relative;
+    }
+
+    .mic-icon.listening {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 6px rgba(123,111,240,0.15), 0 0 20px rgba(123,111,240,0.2);
+      animation: mic-pulse 1.5s ease-in-out infinite;
+    }
+
+    .mic-icon.detected {
+      border-color: var(--green);
+      background: rgba(66,245,176,0.1);
+      box-shadow: 0 0 0 8px rgba(66,245,176,0.15);
+    }
+
+    .mic-icon.error {
+      border-color: var(--danger);
+    }
+
+    @keyframes mic-pulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(123,111,240,0.4), 0 0 20px rgba(123,111,240,0.1); }
+      50%      { box-shadow: 0 0 0 10px rgba(123,111,240,0), 0 0 30px rgba(123,111,240,0.2); }
+    }
+
+    .mic-label {
+      font-size: 0.58rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .keyword {
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: 1rem;
+      letter-spacing: 0.2em;
+      color: var(--accent2);
+      opacity: 0.7;
+    }
+
+    /* Ring */
+    .ring-wrap {
+      position: relative;
+      width: 170px;
+      height: 170px;
+    }
+
+    .ring-wrap svg {
+      transform: rotate(-90deg);
+      width: 100%;
+      height: 100%;
+    }
+
+    .ring-bg {
+      fill: none;
+      stroke: var(--border);
+      stroke-width: 5;
+    }
+
+    .ring-progress {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 5;
+      stroke-linecap: round;
+      stroke-dasharray: 452.39; /* 2π×72 */
+      stroke-dashoffset: 452.39;
+      transition: stroke-dashoffset 0.1s linear, stroke 0.4s;
+      filter: drop-shadow(0 0 5px rgba(123,111,240,0.6));
+    }
+
+    /* Saturn rings decoration inside SVG */
+    .ring-deco {
+      fill: none;
+      stroke: rgba(123,111,240,0.15);
+      stroke-width: 2;
+    }
+
+    .ring-center {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+    }
+
+    .countdown-num {
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: 3.8rem;
+      line-height: 1;
+      color: var(--text);
+    }
+
+    .countdown-label {
+      font-size: 0.52rem;
+      letter-spacing: 0.18em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    /* Wave bars */
+    .wave {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      height: 26px;
+      opacity: 0;
+      transition: opacity 0.5s;
+    }
+
+    body.playing .wave { opacity: 1; }
+
+    .wave span {
+      display: block;
+      width: 3px;
+      background: var(--accent2);
+      border-radius: 2px;
+      animation: bar 0.7s ease-in-out infinite;
+    }
+
+    .wave span:nth-child(1) { animation-delay: 0.0s; height: 8px;  }
+    .wave span:nth-child(2) { animation-delay: 0.1s; height: 18px; }
+    .wave span:nth-child(3) { animation-delay: 0.2s; height: 26px; }
+    .wave span:nth-child(4) { animation-delay: 0.1s; height: 20px; }
+    .wave span:nth-child(5) { animation-delay: 0.3s; height: 14px; }
+    .wave span:nth-child(6) { animation-delay: 0.15s;height: 22px; }
+    .wave span:nth-child(7) { animation-delay: 0.05s;height: 10px; }
+
+    @keyframes bar {
+      0%,100% { transform: scaleY(0.35); opacity: 0.5; }
+      50%      { transform: scaleY(1);   opacity: 1; }
+    }
+
+    /* Status pill */
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 7px 16px;
+      border-radius: 100px;
+      font-size: 0.62rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      transition: all 0.4s;
+    }
+
+    .status-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+
+    .status.listening  { border-color: var(--accent); color: var(--accent2); }
+    .status.listening .status-dot  { background: var(--accent); animation: pdot 1.2s ease-in-out infinite; }
+    .status.waiting   { border-color: var(--yellow); color: var(--yellow); }
+    .status.waiting .status-dot   { background: var(--yellow); animation: pdot 0.8s ease-in-out infinite; }
+    .status.playing   { border-color: var(--green); color: var(--green); }
+    .status.playing .status-dot   { background: var(--green); animation: pdot 1s ease-in-out infinite; }
+    .status.paused    { border-color: var(--muted); color: var(--muted); }
+    .status.error     { border-color: var(--danger); color: var(--danger); }
+    .status.error .status-dot     { background: var(--danger); }
+
+    @keyframes pdot {
+      0%,100% { box-shadow: 0 0 0 0 currentColor; opacity:1; }
+      50%      { box-shadow: 0 0 0 4px transparent; opacity:0.6; }
+    }
+
+    /* Audio picker */
+    .audio-pick {
+      display: block;
+      width: 100%;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      text-align: center;
+      font-size: 0.6rem;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .audio-pick:hover { border-color: var(--accent); color: var(--accent2); }
+
     /* Log */
     .log {
       width: 100%;
